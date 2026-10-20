@@ -17,6 +17,7 @@
 package ats
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -31,6 +32,9 @@ var (
 	refs atomic.Int64
 	// To signal the shutdown of the Go routine.
 	done chan struct{}
+	// Tracks the time-keeping Go routine so that Unregister can wait for
+	// it to fully exit before returning.
+	wg sync.WaitGroup
 )
 
 func init() {
@@ -45,7 +49,9 @@ func Register() {
 		// so spin up Go routine and grab initial time.
 		utime.Store(time.Now().UnixNano())
 
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			ticker := time.NewTicker(TickInterval)
 			defer ticker.Stop()
 			for {
@@ -64,6 +70,10 @@ func Register() {
 func Unregister() {
 	if v := refs.Add(-1); v == 0 {
 		done <- struct{}{}
+		// Wait for the time-keeping Go routine to fully exit before
+		// returning, otherwise callers can observe a lingering Go
+		// routine (e.g. via runtime.NumGoroutine) after we return.
+		wg.Wait()
 	} else if v < 0 {
 		refs.Store(0)
 		panic("unbalanced unregister for access time state")

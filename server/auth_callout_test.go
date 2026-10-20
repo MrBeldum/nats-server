@@ -4291,3 +4291,193 @@ func TestAuthCalloutOperatorModeRejectionNotReportedAsAccountLimit(t *testing.T)
 		t.Fatalf("expected an authentication error in the server log, got %q", errs)
 	}
 }
+
+// authCalloutOpMemResolver is an operator-mode server with a MEMORY resolver
+// preloaded with the system account, an AUTH account running the callout
+// service via external authorization, and a TEST data account whose clients
+// are authorized by that callout.
+type authCalloutOpMemResolver struct {
+	at     *authTest
+	akp    nkeys.KeyPair
+	tkp    nkeys.KeyPair
+	tpub   string
+	secret string
+	// render rebuilds the server config, substituting the AUTH/TEST/SYS account
+	// JWTs and appending extra resolver_preload lines.
+	render  func(authJwt, accJwt, sysJwt, extra string) string
+	authJwt string
+	accJwt  string
+	sysJwt  string
+}
+
+func setupAuthCalloutOpMemResolver(t *testing.T) *authCalloutOpMemResolver {
+	t.Helper()
+
+	_, spub := createKey(t)
+	sysClaim := jwt.NewAccountClaims(spub)
+	sysClaim.Name = "$SYS"
+	sysJwt, err := sysClaim.Encode(oKp)
+	require_NoError(t, err)
+
+	tkp, tpub := createKey(t)
+	accClaim := jwt.NewAccountClaims(tpub)
+	accClaim.Name = "TEST"
+	accJwt, err := accClaim.Encode(oKp)
+	require_NoError(t, err)
+
+	akp, err := nkeys.FromSeed([]byte(authCalloutIssuerSeed))
+	require_NoError(t, err)
+	apub, err := akp.PublicKey()
+	require_NoError(t, err)
+	upub, creds := createAuthServiceUser(t, akp)
+	defer removeFile(t, creds)
+	authClaim := jwt.NewAccountClaims(apub)
+	authClaim.Name = "AUTH"
+	authClaim.EnableExternalAuthorization(upub)
+	authClaim.Authorization.AllowedAccounts.Add(tpub)
+	authJwt, err := authClaim.Encode(oKp)
+	require_NoError(t, err)
+
+	sentinel := createBasicAccountBearer(t, akp)
+
+	const secretToken = "--XX--"
+	render := func(authJwt, accJwt, sysJwt, extra string) string {
+		return fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: MEM
+		resolver_preload: {
+			%s: %s
+			%s: %s
+			%s: %s
+			%s
+		}
+		default_sentinel: %s
+	`, ojwt, spub, apub, authJwt, tpub, accJwt, spub, sysJwt, extra, sentinel)
+	}
+	handler := func(m *nats.Msg) {
+		user, si, _, opts, _ := decodeAuthRequest(t, m.Data)
+		if opts.Token == secretToken {
+			ujwt := createAuthUser(t, user, "dlc", tpub, "", tkp, 0, nil)
+			m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+		} else {
+			m.Respond(nil)
+		}
+	}
+	at := NewAuthTest(t, render(authJwt, accJwt, sysJwt, ""), handler, nats.UserCredentials(creds))
+	return &authCalloutOpMemResolver{at, akp, tkp, tpub, secretToken, render, authJwt, accJwt, sysJwt}
+}
+
+// connectCalloutClient connects a client authorized by the auth callout with
+// reconnect disabled, so a server-side disconnect is directly observable via
+// the returned closed channel.
+func (fx *authCalloutOpMemResolver) connectCalloutClient(t *testing.T) (*nats.Conn, chan struct{}) {
+	t.Helper()
+	closed := make(chan struct{}, 1)
+	creds := createBasicAccountUser(t, fx.akp)
+	defer removeFile(t, creds)
+	nc := fx.at.Connect(nats.UserCredentials(creds), nats.Token(fx.secret),
+		nats.NoReconnect(), nats.ClosedHandler(func(*nats.Conn) { closed <- struct{}{} }))
+	require_NoError(t, nc.Flush())
+	return nc, closed
+}
+
+// connectStaticJWTClient connects a control client using a plain user JWT for
+// the TEST account.
+func (fx *authCalloutOpMemResolver) connectStaticJWTClient(t *testing.T) *nats.Conn {
+	t.Helper()
+	ukp, _ := nkeys.CreateUser()
+	upub, _ := ukp.PublicKey()
+	uc := newJWTTestUserClaims()
+	uc.Name = "static"
+	uc.Subject = upub
+	ujwt, err := uc.Encode(fx.tkp)
+	require_NoError(t, err)
+	nc, err := fx.at.NewClient(
+		nats.UserJWT(func() (string, error) { return ujwt, nil },
+			func(nonce []byte) ([]byte, error) { return ukp.Sign(nonce) }),
+		nats.NoReconnect())
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+	return nc
+}
+
+// https://github.com/nats-io/nats-server/issues/8781
+// In operator mode with a MEMORY resolver, an additive resolver_preload reload
+// (existing account JWTs byte-identical) must not disconnect clients that were
+// authorized by the auth callout.
+func TestAuthCalloutOperatorReloadAdditiveResolverPreload(t *testing.T) {
+	fx := setupAuthCalloutOpMemResolver(t)
+	defer fx.at.Cleanup()
+
+	nc, closed := fx.connectCalloutClient(t)
+	defer nc.Close()
+	sc := fx.connectStaticJWTClient(t)
+	defer sc.Close()
+
+	// Add one unrelated data account and one unrelated callout account,
+	// mirroring the issue. Existing JWTs are unchanged.
+	_, npub1 := createKey(t)
+	nclaim1 := jwt.NewAccountClaims(npub1)
+	nclaim1.Name = "NEW1"
+	njwt1, err := nclaim1.Encode(oKp)
+	require_NoError(t, err)
+	nkp2, npub2 := createKey(t)
+	_ = nkp2
+	nclaim2 := jwt.NewAccountClaims(npub2)
+	nclaim2.Name = "NEW2"
+	nukp2, _ := nkeys.CreateUser()
+	nupub2, _ := nukp2.PublicKey()
+	nclaim2.EnableExternalAuthorization(nupub2)
+	njwt2, err := nclaim2.Encode(oKp)
+	require_NoError(t, err)
+	extra := fmt.Sprintf("%s: %s\n%s: %s", npub1, njwt1, npub2, njwt2)
+
+	changeCurrentConfigContentWithNewContent(t, fx.at.conf,
+		[]byte(fx.render(fx.authJwt, fx.accJwt, fx.sysJwt, extra)))
+	require_NoError(t, fx.at.srv.Reload())
+
+	// The static JWT client must survive.
+	require_NoError(t, sc.Flush())
+	// The callout-authorized client must survive an additive reload.
+	select {
+	case <-closed:
+		t.Fatal("callout-authorized client disconnected on additive resolver reload")
+	case <-time.After(2 * time.Second):
+	}
+	require_NoError(t, nc.Flush())
+}
+
+// When the external authorization (auth callout) configuration of an account
+// changes on reload in operator mode, existing callout clients must be closed
+// so they reconnect and get a fresh callout decision.
+func TestAuthCalloutOperatorReloadExternalAuthChange(t *testing.T) {
+	fx := setupAuthCalloutOpMemResolver(t)
+	defer fx.at.Cleanup()
+
+	nc, closed := fx.connectCalloutClient(t)
+	defer nc.Close()
+
+	// Rotate the callout service user in the AUTH account claims.
+	apub, err := fx.akp.PublicKey()
+	require_NoError(t, err)
+	nukp, _ := nkeys.CreateUser()
+	newUpub, _ := nukp.PublicKey()
+	authClaim := jwt.NewAccountClaims(apub)
+	authClaim.Name = "AUTH"
+	authClaim.EnableExternalAuthorization(newUpub)
+	authClaim.Authorization.AllowedAccounts.Add(fx.tpub)
+	authJwt2, err := authClaim.Encode(oKp)
+	require_NoError(t, err)
+
+	changeCurrentConfigContentWithNewContent(t, fx.at.conf,
+		[]byte(fx.render(authJwt2, fx.accJwt, fx.sysJwt, "")))
+	require_NoError(t, fx.at.srv.Reload())
+
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callout client was not disconnected after external authorization changed")
+	}
+}

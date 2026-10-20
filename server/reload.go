@@ -2292,6 +2292,14 @@ func (s *Server) reloadAuthorization(closeCallouts bool) {
 				s.mu.Unlock()
 				accClaims, claimJWT, _ := s.fetchAccountClaims(accName)
 				if accClaims != nil {
+					// In operator mode the auth callout inputs live in the
+					// account claims, not the server options. If the external
+					// authorization configuration changed, force a fresh
+					// callout decision for existing callout clients, mirroring
+					// calloutInputsChanged for config mode.
+					if externalAuthChangedForReload(acc, accClaims) {
+						closeCallouts = true
+					}
 					if err := s.updateAccountWithClaimJWT(acc, claimJWT); err != nil {
 						s.Noticef("Reloaded: deleting account [bad claims]: %q", accName)
 						s.accounts.Delete(k)
@@ -2382,7 +2390,13 @@ func (s *Server) reloadAuthorization(closeCallouts bool) {
 	}
 
 	for _, c := range clients {
-		callout := c.kind == CLIENT && s.trustedKeys == nil && c.isAuthorizedByCallout()
+		// Clients authorized by the auth callout keep their authorization
+		// across reloads. In operator mode the callout inputs live in the
+		// account claims, and unchanged claims must not disconnect them
+		// (see https://github.com/nats-io/nats-server/issues/8781). When
+		// closeCallouts is set these clients were already moved to cclients
+		// above and closed for a fresh callout decision.
+		callout := c.kind == CLIENT && c.isAuthorizedByCallout()
 		// Disconnect any unauthorized clients.
 		// Ignore internal clients and clients already authorized by callout.
 		if (c.kind == CLIENT || c.kind == LEAF) && !callout && !s.isClientAuthorized(c) {
@@ -2482,6 +2496,32 @@ func (s *Server) clientHasMovedToDifferentAccount(c *client) bool {
 	}
 	// user/nkey no longer exists.
 	return true
+}
+
+// externalAuthChangedForReload reports whether the external authorization
+// (auth callout) configuration of an account differs between its current state
+// and newly fetched claims. This is the operator-mode counterpart of
+// calloutInputsChanged: with an account resolver the callout inputs live in
+// the account JWT, not the server options, so they can only be detected while
+// walking the accounts during a reload.
+func externalAuthChangedForReload(acc *Account, ac *jwt.AccountClaims) bool {
+	acc.mu.RLock()
+	old := acc.extAuth
+	acc.mu.RUnlock()
+	var nw *jwt.ExternalAuthorization
+	if ac.HasExternalAuthorization() {
+		nw = &ac.Authorization
+	}
+	if old == nil || nw == nil {
+		return old != nw
+	}
+	if old.XKey != nw.XKey {
+		return true
+	}
+	if !slices.Equal(old.AuthUsers, nw.AuthUsers) {
+		return true
+	}
+	return !slices.Equal(old.AllowedAccounts, nw.AllowedAccounts)
 }
 
 // calloutInputsChanged checks server tags and authentication settings that
